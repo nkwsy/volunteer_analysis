@@ -197,8 +197,11 @@ def batch_geocode(addresses: List[Dict], api_key: Optional[str] = None, exclude_
                 logging.warning(f"No address found for entry: {addr}")
                 continue
             
-            # Check if this is a zip code only address and we should exclude it
-            if exclude_zip_only and is_zip_code_only(addr['address']):
+            # Check if this is a zip code only address
+            is_zip_only = is_zip_code_only(addr['address'])
+            
+            # If we should exclude zip code only addresses and this is one, skip it
+            if exclude_zip_only and is_zip_only:
                 logging.info(f"Skipping zip code only address: {addr['address']}")
                 continue
                 
@@ -210,7 +213,7 @@ def batch_geocode(addresses: List[Dict], api_key: Optional[str] = None, exclude_
                 addr_copy = addr.copy()
                 addr_copy['latitude'] = lat
                 addr_copy['longitude'] = lng
-                addr_copy['is_zip_only'] = is_zip_code_only(addr['address'])
+                addr_copy['is_zip_only'] = is_zip_only
                 geocoded.append(addr_copy)
                 # Be nice to the geocoding service - Google allows 50 requests per second
                 # but we'll be conservative
@@ -221,4 +224,4 @@ def batch_geocode(addresses: List[Dict], api_key: Optional[str] = None, exclude_
             logging.error(f"Error processing address {addr.get('address', 'unknown')}: {str(e)}")
             continue
     
-    return geocoded 
+    return geocoded

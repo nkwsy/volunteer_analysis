@@ -442,7 +442,8 @@ class DataService:
                 'total_hours': total_hours,
                 'engagement_score': engagement_score,
                 'latitude': getattr(volunteer, 'latitude', None),
-                'longitude': getattr(volunteer, 'longitude', None)
+                'longitude': getattr(volunteer, 'longitude', None),
+                'is_zip_only': getattr(volunteer, 'is_zip_only', False)
             })
         
         if not volunteer_data:

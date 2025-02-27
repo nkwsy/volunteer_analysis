@@ -36,6 +36,7 @@ class Volunteer(BaseModel):
     hours: List[VolunteerHours] = Field(default_factory=list)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    is_zip_only: Optional[bool] = None
     
     @property
     def full_name(self) -> str:

@@ -38,13 +38,14 @@ class DataService:
         if not self.api_available:
             logging.warning("No API client provided. Only local data operations will be available.")
     
-    def load_data(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
+    def load_data(self, start_date: Optional[str] = None, end_date: Optional[str] = None, debug_mode: bool = False):
         """
         Load data from the Galaxy Digital API.
         
         Args:
             start_date: Start date for filtering (YYYY-MM-DD)
             end_date: End date for filtering (YYYY-MM-DD)
+            debug_mode: Whether to enable additional debug logging
         """
         if not self.api_available:
             logging.warning("Cannot load data from API: No API client available")
@@ -98,11 +99,31 @@ class DataService:
                             
                     logging.info(f"Updated {len(detailed_lookup)} volunteers with detailed information")
             
+            # Load all hours data at once instead of per volunteer
+            logging.info("Loading all hours data from API or cache...")
+            try:
+                all_hours_data = self.api_client.get_all_hours(start_date=start_date, end_date=end_date)
+                logging.info(f"Successfully loaded {len(all_hours_data)} hour records from API or cache")
+                
+                # Create a dictionary to map volunteer IDs to their hours
+                volunteer_hours_map = {}
+                for hour_data in all_hours_data:
+                    volunteer_id = hour_data.get('user_id')
+                    if volunteer_id:
+                        if volunteer_id not in volunteer_hours_map:
+                            volunteer_hours_map[volunteer_id] = []
+                        volunteer_hours_map[volunteer_id].append(hour_data)
+                
+                logging.info(f"Organized hours data for {len(volunteer_hours_map)} volunteers")
+            except Exception as hours_error:
+                logging.error(f"Error loading all hours data: {str(hours_error)}")
+                logging.warning("Continuing without hours data")
+                volunteer_hours_map = {}
+            
             self.volunteers = []
             
             # Track errors for reporting
             error_count = 0
-            rate_limit_count = 0
             total_volunteers = len(volunteer_data)
             
             logging.info(f"Processing {total_volunteers} volunteers...")
@@ -113,35 +134,13 @@ class DataService:
             
             for i, v_data in enumerate(volunteer_data):
                 try:
-                    # Add a small delay between requests to avoid rate limiting
-                    if i > 0 and i % 10 == 0:
-                        # Log progress every 10 volunteers
+                    # Log progress every 100 volunteers
+                    if i > 0 and i % 100 == 0:
                         logging.info(f"Processed {i}/{total_volunteers} volunteers...")
-                        # Sleep to avoid rate limiting
-                        time.sleep(0.5)
                     
-                    # Get hours for each volunteer
-                    try:
-                        hours_data = self.api_client.get_volunteer_hours(
-                            v_data['id'], start_date=start_date, end_date=end_date
-                        )
-                    except Exception as hours_error:
-                        if "429" in str(hours_error):
-                            # Rate limited - wait and retry with exponential backoff
-                            wait_time = min(30, 5 * (2 ** rate_limit_count))  # Exponential backoff with max 30 seconds
-                            logging.warning(f"Rate limited when fetching hours for volunteer {v_data['id']}. Waiting {wait_time} seconds...")
-                            rate_limit_count += 1
-                            time.sleep(wait_time)
-                            try:
-                                hours_data = self.api_client.get_volunteer_hours(
-                                    v_data['id'], start_date=start_date, end_date=end_date
-                                )
-                            except Exception as retry_error:
-                                logging.warning(f"Still failed to get hours for volunteer {v_data['id']} after retry: {str(retry_error)}")
-                                hours_data = []
-                        else:
-                            logging.warning(f"Error fetching hours for volunteer {v_data['id']}: {str(hours_error)}")
-                            hours_data = []
+                    # Get hours for this volunteer from the pre-loaded map
+                    volunteer_id = v_data['id']
+                    hours_data = volunteer_hours_map.get(volunteer_id, [])
                     
                     # Convert hours data to VolunteerHours objects
                     hours = []
@@ -171,13 +170,24 @@ class DataService:
                         hour_value = 0.0
                         if 'hour_hours' in h_data and h_data['hour_hours']:
                             try:
-                                hour_value = float(h_data['hour_hours'])
-                            except (ValueError, TypeError):
-                                logging.warning(f"Invalid hours value: {h_data['hour_hours']}")
+                                # Handle different formats of hour_hours from the API
+                                hour_str = str(h_data['hour_hours']).strip()
+                                # Remove any non-numeric characters except decimal point
+                                hour_str = ''.join(c for c in hour_str if c.isdigit() or c == '.')
+                                if hour_str:
+                                    hour_value = float(hour_str)
+                                else:
+                                    logging.warning(f"Empty hours value after cleaning: {h_data['hour_hours']}")
+                            except (ValueError, TypeError) as e:
+                                logging.warning(f"Invalid hours value: {h_data['hour_hours']} - Error: {str(e)}")
+                        
+                        # Log the hour value for debugging
+                        if debug_mode and i < 5:  # Only log for the first few volunteers
+                            logging.debug(f"Hour value: {hour_value} from raw value: {h_data.get('hour_hours', 'N/A')}")
                         
                         hours.append(VolunteerHours(
                             id=h_data.get('id', ''),
-                            volunteer_id=v_data['id'],
+                            volunteer_id=volunteer_id,
                             opportunity_id=opportunity_id,
                             hours=hour_value,
                             date=hour_date,
@@ -244,37 +254,40 @@ class DataService:
             if error_count > 0:
                 logging.warning(f"Encountered errors with {error_count} out of {total_volunteers} volunteers")
             
-            if rate_limit_count > 0:
-                logging.warning(f"Hit rate limits {rate_limit_count} times while loading volunteer data")
-            
             # Load opportunities
             try:
                 logging.info("Loading opportunity data from API or cache...")
                 opportunity_data = self.api_client.get_opportunities()
                 self.opportunities = []
                 
-                for o_data in opportunity_data:
-                    try:
-                        opportunity = Opportunity(
-                            id=o_data['id'],
-                            title=o_data.get('title', ''),
-                            description=o_data.get('description', ''),
-                            address=o_data.get('address', ''),
-                            city=o_data.get('city', ''),
-                            state=o_data.get('state', ''),
-                            zip_code=o_data.get('zip_code', ''),
-                            start_date=datetime.fromisoformat(o_data.get('start_date', '').replace('Z', '+00:00')) 
-                                      if 'start_date' in o_data and o_data['start_date'] else None,
-                            end_date=datetime.fromisoformat(o_data.get('end_date', '').replace('Z', '+00:00')) 
-                                    if 'end_date' in o_data and o_data['end_date'] else None,
-                            status=o_data.get('status', 'active')
-                        )
-                        self.opportunities.append(opportunity)
-                    except Exception as opp_error:
-                        logging.warning(f"Error processing opportunity {o_data.get('id')}: {str(opp_error)}")
-                        continue
+                if opportunity_data:
+                    logging.info(f"Successfully loaded {len(opportunity_data)} opportunities from API or cache")
+                    
+                    # Process all opportunities at once
+                    for o_data in opportunity_data:
+                        try:
+                            opportunity = Opportunity(
+                                id=o_data['id'],
+                                title=o_data.get('title', ''),
+                                description=o_data.get('description', ''),
+                                address=o_data.get('address', ''),
+                                city=o_data.get('city', ''),
+                                state=o_data.get('state', ''),
+                                zip_code=o_data.get('zip_code', ''),
+                                start_date=datetime.fromisoformat(o_data.get('start_date', '').replace('Z', '+00:00')) 
+                                          if 'start_date' in o_data and o_data['start_date'] else None,
+                                end_date=datetime.fromisoformat(o_data.get('end_date', '').replace('Z', '+00:00')) 
+                                        if 'end_date' in o_data and o_data['end_date'] else None,
+                                status=o_data.get('status', 'active')
+                            )
+                            self.opportunities.append(opportunity)
+                        except Exception as opp_error:
+                            logging.warning(f"Error processing opportunity {o_data.get('id')}: {str(opp_error)}")
+                            continue
+                else:
+                    logging.warning("No opportunity data returned from API or cache")
                 
-                logging.info(f"Loaded {len(self.opportunities)} opportunities")
+                logging.info(f"Processed {len(self.opportunities)} opportunities")
             except Exception as opp_load_error:
                 logging.error(f"Error loading opportunities: {str(opp_load_error)}")
                 logging.info("Continuing with volunteer data only")
@@ -1041,4 +1054,44 @@ class DataService:
                 'average_hours_per_opportunity': 0,
                 'most_popular_opportunities': [],
                 'highest_hour_opportunities': []
-            } 
+            }
+    
+    def fix_hour_values(self):
+        """
+        Fix any incorrect hour values in the existing volunteer data.
+        This can be called after loading data from a GeoJSON file to ensure
+        hour values are correctly formatted.
+        
+        Returns:
+            int: Number of hour values fixed
+        """
+        if not self.volunteers:
+            logging.warning("No volunteer data available to fix hour values")
+            return 0
+            
+        fixed_count = 0
+        for volunteer in self.volunteers:
+            for hour in volunteer.hours:
+                if isinstance(hour.hours, str):
+                    try:
+                        # Clean the hour value
+                        hour_str = hour.hours.strip()
+                        # Remove any non-numeric characters except decimal point
+                        hour_str = ''.join(c for c in hour_str if c.isdigit() or c == '.')
+                        if hour_str:
+                            old_value = hour.hours
+                            hour.hours = float(hour_str)
+                            fixed_count += 1
+                            logging.info(f"Fixed hour value: {old_value} -> {hour.hours}")
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Could not fix invalid hour value: {hour.hours} - Error: {str(e)}")
+                        # Set to 0 if we can't parse it
+                        hour.hours = 0.0
+                        fixed_count += 1
+        
+        # Recreate dataframes with the fixed hour values
+        if fixed_count > 0:
+            self._create_dataframes()
+            logging.info(f"Fixed {fixed_count} hour values and recreated dataframes")
+            
+        return fixed_count 

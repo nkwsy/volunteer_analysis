@@ -2,13 +2,24 @@ import re
 import time
 import logging
 import requests
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import os
 from dotenv import load_dotenv
 import random
+import concurrent.futures
+import json
+from pathlib import Path
+import urllib.parse
 
 # Load environment variables
 load_dotenv()
+
+# Create a geocoding cache directory if it doesn't exist
+CACHE_DIR = Path("geocode_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Global cache to avoid duplicate API calls within the same session
+ADDRESS_CACHE = {}
 
 def sanitize_address(address: str) -> str:
     """
@@ -49,6 +60,91 @@ def is_zip_code_only(address: str) -> bool:
     clean = re.sub(r'\s+', '', address)
     return bool(re.match(r'^\d{5}(-\d{4})?$', clean))
 
+def get_cache_key(address: str) -> str:
+    """
+    Generate a cache key for an address.
+    
+    Args:
+        address: Address to generate a key for
+        
+    Returns:
+        Cache key string
+    """
+    # Normalize the address for consistent cache keys
+    normalized = re.sub(r'\s+', ' ', address.lower().strip())
+    return normalized
+
+def load_from_cache(address: str) -> Optional[Dict[str, float]]:
+    """
+    Try to load geocoding results from cache.
+    
+    Args:
+        address: Address to look up
+        
+    Returns:
+        Cached coordinates as dict with 'latitude' and 'longitude' keys or None if not in cache
+    """
+    # Check in-memory cache first
+    cache_key = get_cache_key(address)
+    if cache_key in ADDRESS_CACHE:
+        logging.debug(f"Cache hit (memory): {address}")
+        return ADDRESS_CACHE[cache_key]
+    
+    # Check file cache
+    cache_file = CACHE_DIR / f"{hash(cache_key)}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+                # Handle both old and new format
+                if 'latitude' in data and 'longitude' in data:
+                    result = {
+                        'latitude': data['latitude'],
+                        'longitude': data['longitude']
+                    }
+                    ADDRESS_CACHE[cache_key] = result
+                    return result
+                elif 'lat' in data and 'lng' in data:
+                    # Convert old format to new format
+                    result = {
+                        'latitude': data['lat'],
+                        'longitude': data['lng']
+                    }
+                    ADDRESS_CACHE[cache_key] = result
+                    return result
+        except Exception as e:
+            logging.warning(f"Error reading cache file for {address}: {str(e)}")
+    
+    return None
+
+def save_to_cache(address: str, coordinates: Dict[str, float]) -> None:
+    """
+    Save geocoding results to cache.
+    
+    Args:
+        address: Address that was geocoded
+        coordinates: Coordinates dict with 'latitude' and 'longitude' keys
+    """
+    if not coordinates:
+        return
+        
+    cache_key = get_cache_key(address)
+    
+    # Save to memory cache
+    ADDRESS_CACHE[cache_key] = coordinates
+    
+    # Save to file cache
+    cache_file = CACHE_DIR / f"{hash(cache_key)}.json"
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump({
+                'address': address,
+                'latitude': coordinates['latitude'],
+                'longitude': coordinates['longitude']
+            }, f)
+    except Exception as e:
+        logging.warning(f"Error writing cache file for {address}: {str(e)}")
+
 def geocode_zip_code(zip_code: str, api_key: Optional[str] = None) -> Optional[Tuple[float, float]]:
     """
     Geocode a zip code to get coordinates, with a small random offset to distribute points.
@@ -60,50 +156,41 @@ def geocode_zip_code(zip_code: str, api_key: Optional[str] = None) -> Optional[T
     Returns:
         Tuple of (latitude, longitude) or None if geocoding failed
     """
-    # Get API key from environment if not provided
     if not api_key:
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         
     if not api_key:
-        logging.error("No Google Maps API key provided. Set GOOGLE_MAPS_API_KEY in your .env file.")
+        logging.error("No Google Maps API key provided")
         return None
         
+    # Check cache first
+    cached_result = load_from_cache(zip_code)
+    if cached_result:
+        return cached_result
+    
+    # Clean the zip code
+    zip_code = zip_code.strip()
+    
+    # Construct the URL for the API request
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={zip_code}&key={api_key}"
+    
     try:
-        # Clean the zip code
-        clean_zip = re.sub(r'\s+', '', zip_code)
-        if '-' in clean_zip:
-            clean_zip = clean_zip.split('-')[0]  # Use only the first part of ZIP+4
+        response = requests.get(url)
+        data = response.json()
         
-        # Build the Google Geocoding API URL
-        base_url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {
-            "address": clean_zip,
-            "key": api_key
-        }
-        
-        # Make the request
-        response = requests.get(base_url, params=params)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            data = response.json()
+        if data['status'] == 'OK' and data['results']:
+            location = data['results'][0]['geometry']['location']
+            result = {
+                'latitude': location['lat'],
+                'longitude': location['lng']
+            }
             
-            # Check if Google returned results
-            if data["status"] == "OK" and len(data["results"]) > 0:
-                # Get the first result
-                location = data["results"][0]["geometry"]["location"]
-                
-                # Add a small random offset (approximately within 500m)
-                # 0.005 degrees is roughly 500 meters
-                lat_offset = random.uniform(-0.003, 0.003)
-                lng_offset = random.uniform(-0.003, 0.003)
-                
-                return (location["lat"] + lat_offset, location["lng"] + lng_offset)
-            else:
-                logging.warning(f"Google Geocoding API returned no results for zip code: {zip_code}. Status: {data['status']}")
-                return None
+            # Save to cache
+            save_to_cache(zip_code, result)
+            
+            return result
         else:
-            logging.error(f"Google Geocoding API request failed with status code {response.status_code}: {response.text}")
+            logging.warning(f"Failed to geocode zip code {zip_code}: {data.get('status', 'Unknown error')}")
             return None
             
     except Exception as e:
@@ -121,107 +208,177 @@ def geocode_address(address: str, api_key: Optional[str] = None) -> Optional[Tup
     Returns:
         Tuple of (latitude, longitude) or None if geocoding failed
     """
-    # Get API key from environment if not provided
     if not api_key:
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         
     if not api_key:
-        logging.error("No Google Maps API key provided. Set GOOGLE_MAPS_API_KEY in your .env file.")
+        logging.error("No Google Maps API key provided")
         return None
     
-    # Check if this is a zip code only
-    if is_zip_code_only(address):
-        logging.info(f"Geocoding zip code: {address}")
-        return geocode_zip_code(address, api_key)
-        
+    # Check cache first
+    cached_result = load_from_cache(address)
+    if cached_result:
+        return cached_result
+    
+    # Sanitize the address
+    address = sanitize_address(address)
+    
+    # Construct the URL for the API request
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={urllib.parse.quote(address)}&key={api_key}"
+    
     try:
-        # Sanitize the address
-        clean_address = sanitize_address(address)
+        response = requests.get(url)
+        data = response.json()
         
-        # Build the Google Geocoding API URL
-        base_url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {
-            "address": clean_address,
-            "key": api_key
-        }
-        
-        # Make the request
-        response = requests.get(base_url, params=params)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            data = response.json()
+        if data['status'] == 'OK' and data['results']:
+            location = data['results'][0]['geometry']['location']
+            result = {
+                'latitude': location['lat'],
+                'longitude': location['lng']
+            }
             
-            # Check if Google returned results
-            if data["status"] == "OK" and len(data["results"]) > 0:
-                # Get the first result
-                location = data["results"][0]["geometry"]["location"]
-                return (location["lat"], location["lng"])
-            else:
-                logging.warning(f"Google Geocoding API returned no results for address: {address}. Status: {data['status']}")
-                return None
+            # Save to cache
+            save_to_cache(address, result)
+            
+            return result
         else:
-            logging.error(f"Google Geocoding API request failed with status code {response.status_code}: {response.text}")
+            logging.warning(f"Failed to geocode address {address}: {data.get('status', 'Unknown error')}")
             return None
             
     except Exception as e:
         logging.error(f"Error geocoding address {address}: {str(e)}")
         return None
 
-def batch_geocode(addresses: List[Dict], api_key: Optional[str] = None, exclude_zip_only: bool = False) -> List[Dict]:
+def geocode_address_worker(args):
     """
-    Geocode a batch of addresses using Google's Geocoding API.
+    Worker function for geocoding a single address.
     
     Args:
-        addresses: List of dictionaries with address information
-        api_key: Google Maps API key (optional, will use GOOGLE_MAPS_API_KEY env var if not provided)
-        exclude_zip_only: Whether to exclude addresses that are only zip codes
-        
+        args (tuple): Tuple containing (address_dict, api_key, exclude_zip_only)
+            address_dict should have 'id' and 'address' keys
+    
     Returns:
-        List of dictionaries with added coordinates
+        dict: Dictionary with 'id', 'latitude', 'longitude' keys or None if geocoding failed
     """
-    # Get API key from environment if not provided
-    if not api_key:
-        api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    address_dict, api_key, exclude_zip_only = args
+    
+    if not address_dict or 'address' not in address_dict or not address_dict['address']:
+        logging.warning(f"Skipping geocoding for empty address: {address_dict}")
+        return None
+    
+    address = address_dict['address']
+    address_id = address_dict.get('id', 'unknown')
+    
+    # Check if this is a zip code only address
+    is_zip_only = is_zip_code_only(address)
+    
+    # Skip zip code only addresses if requested
+    if exclude_zip_only and is_zip_only:
+        logging.info(f"Skipping zip code only address: {address}")
+        return None
+    
+    # Try to load from cache first
+    cached_result = load_from_cache(address)
+    if cached_result:
+        logging.info(f"Using cached geocoding result for: {address}")
+        return {
+            'id': address_id,
+            'latitude': cached_result['latitude'],
+            'longitude': cached_result['longitude'],
+            'is_zip_only': is_zip_only
+        }
+    
+    # Geocode the address
+    try:
+        if is_zip_only:
+            result = geocode_zip_code(address, api_key)
+        else:
+            sanitized_address = sanitize_address(address)
+            result = geocode_address(sanitized_address, api_key)
         
-    if not api_key:
-        logging.error("No Google Maps API key provided. Set GOOGLE_MAPS_API_KEY in your .env file.")
-        return addresses
-    
-    geocoded = []
-    
-    for addr in addresses:
-        try:
-            # Check if address field exists
-            if 'address' not in addr or not addr['address']:
-                logging.warning(f"No address found for entry: {addr}")
-                continue
+        if result and 'latitude' in result and 'longitude' in result:
+            # Save to cache
+            save_to_cache(address, result)
             
-            # Check if this is a zip code only address
-            is_zip_only = is_zip_code_only(addr['address'])
+            # Return the result with the ID
+            return {
+                'id': address_id,
+                'latitude': result['latitude'],
+                'longitude': result['longitude'],
+                'is_zip_only': is_zip_only
+            }
+        else:
+            logging.warning(f"Failed to geocode address: {address}")
+            return None
             
-            # If we should exclude zip code only addresses and this is one, skip it
-            if exclude_zip_only and is_zip_only:
-                logging.info(f"Skipping zip code only address: {addr['address']}")
-                continue
+    except Exception as e:
+        logging.error(f"Error geocoding address {address}: {str(e)}")
+        return None
+
+def batch_geocode(addresses, api_key, exclude_zip_only=False, max_workers=10, progress_callback=None):
+    """
+    Geocode a batch of addresses using parallel processing.
+    
+    Args:
+        addresses (list): List of dictionaries with 'id' and 'address' keys
+        api_key (str): Google Maps API key
+        exclude_zip_only (bool): Whether to exclude zip code only addresses
+        max_workers (int): Maximum number of parallel workers
+        progress_callback (callable): Optional callback function to report progress
+            The callback will receive (current_count, total_count, success_count)
+    
+    Returns:
+        list: List of dictionaries with 'id', 'latitude', 'longitude' keys
+    """
+    if not addresses:
+        return []
+    
+    # Create cache directory if it doesn't exist
+    cache_dir = Path("geocode_cache")
+    cache_dir.mkdir(exist_ok=True)
+    
+    # Determine the actual number of workers based on the number of addresses
+    actual_workers = min(max_workers, len(addresses))
+    
+    # Initialize counters for progress reporting
+    processed_count = 0
+    success_count = 0
+    total_count = len(addresses)
+    
+    # Create a list to store the results
+    results = []
+    
+    logging.info(f"Geocoding {len(addresses)} addresses using {actual_workers} workers")
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        # Submit all geocoding tasks
+        future_to_address = {
+            executor.submit(geocode_address_worker, (address, api_key, exclude_zip_only)): address
+            for address in addresses
+        }
+        
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(future_to_address):
+            address = future_to_address[future]
+            processed_count += 1
+            
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+                    success_count += 1
                 
-            # Geocode the address
-            result = geocode_address(addr['address'], api_key)
-            
-            if result:
-                lat, lng = result
-                addr_copy = addr.copy()
-                addr_copy['latitude'] = lat
-                addr_copy['longitude'] = lng
-                addr_copy['is_zip_only'] = is_zip_only
-                geocoded.append(addr_copy)
-                # Be nice to the geocoding service - Google allows 50 requests per second
-                # but we'll be conservative
-                time.sleep(0.1)
-            else:
-                logging.warning(f"Could not geocode address: {addr['address']}")
-        except Exception as e:
-            logging.error(f"Error processing address {addr.get('address', 'unknown')}: {str(e)}")
-            continue
+                # Call progress callback if provided
+                if progress_callback:
+                    progress_callback(processed_count, total_count, success_count)
+                
+                # Log progress periodically
+                if processed_count % 10 == 0 or processed_count == total_count:
+                    logging.info(f"Geocoded {processed_count}/{total_count} addresses ({success_count} successful)")
+                
+            except Exception as e:
+                logging.error(f"Error geocoding address {address['address']}: {str(e)}")
     
-    return geocoded
+    logging.info(f"Completed geocoding {len(addresses)} addresses. Successfully geocoded: {success_count}")
+    return results

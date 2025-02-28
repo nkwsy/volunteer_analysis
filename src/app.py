@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import folium
+import time
 
 # Load environment variables
 load_dotenv()
@@ -75,6 +76,12 @@ def main():
                 try:
                     logging.info("Automatically loading data from addresses.geojson")
                     st.session_state.data_service.load_from_geojson("addresses.geojson")
+                    
+                    # Fix any incorrect hour values
+                    fixed_count = st.session_state.data_service.fix_hour_values()
+                    if fixed_count > 0:
+                        st.info(f"Fixed {fixed_count} hour values in the loaded data")
+                        
                     st.success(f"Successfully loaded {len(st.session_state.data_service.volunteers)} volunteers from addresses.geojson")
                 except Exception as e:
                     logging.error(f"Error auto-loading addresses.geojson: {str(e)}")
@@ -206,7 +213,8 @@ def main():
                             # Load data
                             st.session_state.data_service.load_data(
                                 start_date=start_date.strftime("%Y-%m-%d"),
-                                end_date=end_date.strftime("%Y-%m-%d")
+                                end_date=end_date.strftime("%Y-%m-%d"),
+                                debug_mode=debug_mode
                             )
                             
                             progress_bar.progress(100)
@@ -257,6 +265,12 @@ def main():
                 with st.spinner("Loading data from GeoJSON file..."):
                     try:
                         st.session_state.data_service.load_from_geojson("temp_upload.geojson")
+                        
+                        # Fix any incorrect hour values
+                        fixed_count = st.session_state.data_service.fix_hour_values()
+                        if fixed_count > 0:
+                            st.info(f"Fixed {fixed_count} hour values in the loaded data")
+                            
                         st.success("Data loaded successfully!")
                     except Exception as e:
                         st.error(f"Error loading data: {str(e)}")
@@ -270,6 +284,12 @@ def main():
                         # Check if the file exists first
                         if os.path.exists("addresses.geojson"):
                             st.session_state.data_service.load_from_geojson("addresses.geojson")
+                            
+                            # Fix any incorrect hour values
+                            fixed_count = st.session_state.data_service.fix_hour_values()
+                            if fixed_count > 0:
+                                st.info(f"Fixed {fixed_count} hour values in the loaded data")
+                                
                             st.success("Data loaded successfully!")
                         else:
                             st.error("Default GeoJSON file 'addresses.geojson' not found.")
@@ -303,10 +323,12 @@ def main():
                             # Prepare addresses for geocoding
                             addresses_to_geocode = []
                             skipped_zip_only = 0
+                            already_geocoded = 0
                             
                             for volunteer in st.session_state.data_service.volunteers:
                                 # Skip volunteers that already have coordinates
                                 if hasattr(volunteer, 'latitude') and hasattr(volunteer, 'longitude') and volunteer.latitude and volunteer.longitude:
+                                    already_geocoded += 1
                                     continue
                                     
                                 # Check if this is a zip code only address
@@ -332,18 +354,41 @@ def main():
                             
                             # Show progress
                             progress_text = st.empty()
-                            progress_text.text(f"Geocoding {len(addresses_to_geocode)} addresses...")
+                            progress_bar = st.progress(0)
                             
+                            if already_geocoded > 0:
+                                st.info(f"Skipped {already_geocoded} volunteers that already have coordinates")
+                                
                             if skipped_zip_only > 0:
                                 st.info(f"Skipped {skipped_zip_only} zip code-only addresses as requested")
                             
+                            if not addresses_to_geocode:
+                                st.warning("No addresses to geocode. All volunteers either have coordinates or were skipped.")
+                                return
+                                
+                            progress_text.text(f"Geocoding {len(addresses_to_geocode)} addresses using parallel processing...")
+                            
+                            # Create a callback to update progress
+                            def progress_callback(current, total, success_count):
+                                progress_bar.progress(current / total)
+                                progress_text.text(f"Geocoded {current}/{total} addresses ({success_count} successful)...")
+                            
                             # Geocode addresses
-                            from utils.geocoding import batch_geocode
-                            geocoded_addresses = batch_geocode(addresses_to_geocode, api_key=google_maps_api_key)
+                            start_time = time.time()
+                            geocoded_addresses = batch_geocode(
+                                addresses_to_geocode, 
+                                api_key=google_maps_api_key,
+                                exclude_zip_only=exclude_zip_only_geocoding,
+                                progress_callback=progress_callback
+                            )
+                            end_time = time.time()
                             
                             # Update volunteer objects with geocoded coordinates
                             geocoded_count = 0
                             for geocoded in geocoded_addresses:
+                                if not geocoded:
+                                    continue
+                                    
                                 for volunteer in st.session_state.data_service.volunteers:
                                     if volunteer.id == geocoded['id']:
                                         volunteer.latitude = geocoded['latitude']
@@ -359,8 +404,15 @@ def main():
                             # Save the updated data to GeoJSON
                             st.session_state.data_service.save_volunteer_geojson()
                             
+                            # Clear progress indicators
                             progress_text.empty()
-                            st.success(f"Successfully geocoded {geocoded_count} out of {len(addresses_to_geocode)} addresses.")
+                            progress_bar.empty()
+                            
+                            # Calculate time taken
+                            time_taken = end_time - start_time
+                            addresses_per_second = len(addresses_to_geocode) / time_taken if time_taken > 0 else 0
+                            
+                            st.success(f"Successfully geocoded {geocoded_count} out of {len(addresses_to_geocode)} addresses in {time_taken:.1f} seconds ({addresses_per_second:.1f} addresses/second).")
                             
                             # If we have a map view, suggest refreshing
                             st.info("Please refresh the map view to see the updated coordinates.")
@@ -372,6 +424,15 @@ def main():
         # Map options
         if hasattr(st.session_state.data_service, 'volunteer_df') and st.session_state.data_service.volunteer_df is not None:
             st.header("Map Options")
+            
+            # Add a button to fix hour values
+            if st.button("Fix Hour Values"):
+                with st.spinner("Fixing hour values..."):
+                    fixed_count = st.session_state.data_service.fix_hour_values()
+                    if fixed_count > 0:
+                        st.success(f"Fixed {fixed_count} hour values in the data")
+                    else:
+                        st.info("No hour values needed fixing")
             
             show_markers = st.checkbox("Show Markers", value=False)
             show_dots = st.checkbox("Show Dots", value=True)

@@ -548,6 +548,30 @@ class GalaxyDigitalAPI:
         response = self._make_request("hours/summary", params=params, use_cache=use_cache)
         return response.get('data', {})
     
+    def get_all_hours(self, start_date: Optional[str] = None, 
+                     end_date: Optional[str] = None, use_cache: Optional[bool] = None) -> List[Dict]:
+        """
+        Get all hours data in one API call.
+        
+        Args:
+            start_date: Start date for filtering (YYYY-MM-DD)
+            end_date: End date for filtering (YYYY-MM-DD)
+            use_cache: Whether to use cache for this request
+            
+        Returns:
+            List of all hours data
+        """
+        params = {'per_page': 150}
+        if start_date:
+            params['start_date'] = start_date
+        if end_date:
+            params['end_date'] = end_date
+            
+        logging.info(f"Getting all hours data with params: {params}")
+        
+        # Use the get_all_data method to handle pagination
+        return self.get_all_data("hours", params=params, use_cache=use_cache)
+    
     def get_volunteer_addresses(self, use_cache: Optional[bool] = None) -> List[Dict]:
         """
         Get addresses for all volunteers.
@@ -614,17 +638,52 @@ class GalaxyDigitalAPI:
         """
         detailed_volunteers = []
         
-        for i, volunteer_id in enumerate(volunteer_ids):
-            # Add a small delay to avoid rate limiting
-            if i > 0 and i % 5 == 0:
-                time.sleep(0.5)
+        # Check if we have a complete cached dataset first
+        if self.use_cache if use_cache is None else use_cache:
+            if self.cache_manager:
+                # Try to load from cache first
+                cache_key = "detailed_volunteers"
+                cache_params = {'ids': ','.join(sorted(volunteer_ids))}
+                cached_data = self.cache_manager.load_from_cache(cache_key, cache_params)
+                if cached_data is not None:
+                    logging.info(f"Using cached detailed volunteer data for {len(cached_data)} volunteers")
+                    return cached_data
+        
+        # If we have a lot of IDs, process them in batches to avoid rate limiting
+        batch_size = 100
+        total_batches = (len(volunteer_ids) + batch_size - 1) // batch_size
+        
+        logging.info(f"Getting detailed data for {len(volunteer_ids)} volunteers in {total_batches} batches")
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(volunteer_ids))
+            batch_ids = volunteer_ids[start_idx:end_idx]
+            
+            logging.info(f"Processing batch {batch_num + 1}/{total_batches} with {len(batch_ids)} volunteers")
+            
+            # Add a small delay between batches to avoid rate limiting
+            if batch_num > 0:
+                time.sleep(1)
                 
-            try:
-                volunteer_data = self.get_volunteer(volunteer_id, use_cache=use_cache)
-                if volunteer_data:
-                    detailed_volunteers.append(volunteer_data)
-            except Exception as e:
-                logging.warning(f"Error getting detailed data for volunteer {volunteer_id}: {str(e)}")
+            for volunteer_id in batch_ids:
+                try:
+                    volunteer_data = self.get_volunteer(volunteer_id, use_cache=use_cache)
+                    if volunteer_data:
+                        detailed_volunteers.append(volunteer_data)
+                except Exception as e:
+                    logging.warning(f"Error getting detailed data for volunteer {volunteer_id}: {str(e)}")
+            
+            # Log progress
+            logging.info(f"Completed batch {batch_num + 1}/{total_batches}, retrieved {len(detailed_volunteers)} volunteers so far")
+        
+        # Save to cache if enabled
+        if self.use_cache if use_cache is None else use_cache:
+            if self.cache_manager and detailed_volunteers:
+                cache_key = "detailed_volunteers"
+                cache_params = {'ids': ','.join(sorted(volunteer_ids))}
+                self.cache_manager.save_to_cache(cache_key, cache_params, detailed_volunteers)
+                logging.info(f"Saved detailed data for {len(detailed_volunteers)} volunteers to cache")
                 
         logging.info(f"Retrieved detailed data for {len(detailed_volunteers)} out of {len(volunteer_ids)} volunteers")
         return detailed_volunteers 
